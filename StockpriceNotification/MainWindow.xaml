@@ -219,7 +219,7 @@
                                     <ColumnDefinition Width="52"/>
                                 </Grid.ColumnDefinitions>
                                 <TextBox Grid.Column="0" x:Name="TickerInput" Style="{StaticResource Input}"
-                                         Text="7203" KeyDown="TickerInput_KeyDown"/>
+                                         Text="" KeyDown="TickerInput_KeyDown"/>
                                 <Button Grid.Column="2" x:Name="AddButton" Content="＋ 追加"
                                         Style="{StaticResource BtnGreen}" VerticalAlignment="Stretch"
                                         Click="AddButton_Click"/>
