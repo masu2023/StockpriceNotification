@@ -143,14 +143,13 @@
 
     </Window.Resources>
 
-    <!-- 最外枠: 上部ヘッダー + 下部2カラム -->
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
-        <!-- ══ ヘッダーバー ══ -->
+        <!-- ヘッダーバー -->
         <Border Grid.Row="0" Background="#161B22" Padding="16,10">
             <Grid>
                 <Grid.ColumnDefinitions>
@@ -161,7 +160,6 @@
                 <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock Text="📈 株価モニター" Foreground="#F0F6FC" FontSize="16" FontWeight="Bold" VerticalAlignment="Center"/>
                     <TextBlock Text="  Japan Stock Price Alert" Foreground="#484F58" FontSize="11" VerticalAlignment="Center" Margin="0,2,0,0"/>
-                    <!-- 日経平均テスト表示 -->
                     <Border CornerRadius="6" Padding="10,3" Background="#0D1117" Margin="20,0,0,0" VerticalAlignment="Center">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="日経平均 " Foreground="#8B949E" FontSize="11" VerticalAlignment="Center"/>
@@ -175,19 +173,16 @@
                 </StackPanel>
 
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                    <!-- ステータス -->
                     <Border CornerRadius="10" Padding="8,3" Background="#0D1117" Margin="0,0,12,0">
                         <StackPanel Orientation="Horizontal">
                             <Ellipse x:Name="StatusDot" Width="7" Height="7" Fill="#8B949E" Margin="0,0,5,0"/>
                             <TextBlock x:Name="StatusText" Text="待機中" Foreground="#8B949E" FontSize="11"/>
                         </StackPanel>
                     </Border>
-                    <!-- 更新間隔 -->
                     <TextBlock Text="更新:" Foreground="#8B949E" FontSize="11" VerticalAlignment="Center" Margin="0,0,4,0"/>
                     <TextBox x:Name="IntervalInput" Style="{StaticResource Input}"
                              Text="30" Width="46" FontSize="11" Padding="5,4"/>
                     <TextBlock Text="秒" Foreground="#8B949E" FontSize="11" VerticalAlignment="Center" Margin="4,0,16,0"/>
-                    <!-- 操作ボタン -->
                     <Button x:Name="StartButton" Content="▶ スタート"
                             Style="{StaticResource BtnGreen}" Height="28" Margin="0,0,6,0"
                             Click="StartButton_Click"/>
@@ -198,7 +193,7 @@
             </Grid>
         </Border>
 
-        <!-- ══ 2カラムメインエリア ══ -->
+        <!-- 2カラムメインエリア -->
         <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="320" MinWidth="280" MaxWidth="400"/>
@@ -206,7 +201,7 @@
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
-            <!-- ── 左ペイン: 設定 ── -->
+            <!-- 左ペイン -->
             <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" Padding="12,10,6,10">
                 <StackPanel>
 
@@ -215,7 +210,7 @@
                         <StackPanel>
                             <TextBlock Style="{StaticResource SectionTitle}" Text="🔍 銘柄追加"/>
                             <TextBlock Style="{StaticResource Label}" Text="銘柄コード（例: 7203 / 285A / AAPL）"/>
-                            <Grid Margin="0,0,0,0">
+                            <Grid>
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="6"/>
@@ -368,7 +363,6 @@
                         </StackPanel>
                     </Border>
 
-                    <!-- IntervalHint（更新間隔の説明） -->
                     <TextBlock x:Name="IntervalHint" Text="30秒ごとに全銘柄を取得します"
                                Foreground="#484F58" FontSize="10" Margin="2,0,0,0"/>
 
@@ -378,7 +372,7 @@
             <!-- 区切り縦線 -->
             <Border Grid.Column="1" Background="#21262D" Width="1" HorizontalAlignment="Center"/>
 
-            <!-- ── 右ペイン: 監視一覧 ── -->
+            <!-- 右ペイン -->
             <Grid Grid.Column="2" Margin="6,10,12,10">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
