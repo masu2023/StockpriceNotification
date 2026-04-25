@@ -21,32 +21,62 @@ namespace StockMonitor
 {
     public partial class MainWindow : Window
     {
-        private readonly ObservableCollection<StockItem> _stocks = new ObservableCollection<StockItem>();
-        private readonly HttpClient _http = new HttpClient();
+        // ─── 共有 HttpClient（シングルトン） ──────────────────────────────────
+        // HttpClient は使い捨てにすると接続枯渇が起きるため static で共有する
+        private static readonly HttpClient _http = CreateHttpClient();
+
+        private static HttpClient CreateHttpClient()
+        {
+            var client = new HttpClient(new HttpClientHandler
+            {
+                UseCookies            = false,
+                AllowAutoRedirect     = true,
+                MaxAutomaticRedirections = 3
+            });
+            client.Timeout = TimeSpan.FromSeconds(15);
+            client.DefaultRequestHeaders.TryAddWithoutValidation(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+            client.DefaultRequestHeaders.TryAddWithoutValidation(
+                "Accept", "application/json, text/html, */*");
+            return client;
+        }
+
+        // ─── フィールド ───────────────────────────────────────────────────────
+        private readonly ObservableCollection<StockItem> _stocks = new();
         private CancellationTokenSource? _cts;
         private bool _isRunning = false;
         private StockItem? _selectedItem = null;
 
-        private readonly Dictionary<string, string> _alertedState = new Dictionary<string, string>();
-        private readonly Dictionary<string, Queue<(DateTime time, double price)>> _priceHistory
-            = new Dictionary<string, Queue<(DateTime, double)>>();
+        // アラート重複防止
+        private readonly Dictionary<string, string> _alertedState = new();
+
+        // 急騰・急落用価格履歴
+        private readonly Dictionary<string, Queue<(DateTime time, double price)>> _priceHistory = new();
+
+        // 出来高急増用: 前日出来高キャッシュ (symbol -> previousVolume)
+        private readonly Dictionary<string, long> _prevDayVolume = new();
+
         private int _intervalSeconds = 30;
 
         private static readonly string SavePath =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                          "StockMonitor", "settings.json");
 
+        // ─── Cookie / Crumb 管理 ──────────────────────────────────────────────
+        private string _crumb  = "";
+        private string _cookie = "";
+        private readonly SemaphoreSlim _crumbLock = new(1, 1);
+
+        // ─── 初期化 ───────────────────────────────────────────────────────────
         public MainWindow()
         {
             InitializeComponent();
-            _http.Timeout = TimeSpan.FromSeconds(10);
-            _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-            _http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
-            _stocks.CollectionChanged += (_, __) => RefreshStockPanel();
+            _stocks.CollectionChanged += (_, _) => RefreshStockPanel();
             LoadSettings();
         }
 
+        // ─── 設定保存・読込 ───────────────────────────────────────────────────
         private void LoadSettings()
         {
             try
@@ -84,11 +114,7 @@ namespace StockMonitor
             SaveSettings();
         }
 
-        // ─── Cookie / Crumb 管理 ──────────────────────────────────────────────
-        private string _crumb  = "";
-        private string _cookie = "";
-        private readonly SemaphoreSlim _crumbLock = new SemaphoreSlim(1, 1);
-
+        // ─── Cookie / Crumb 取得 ─────────────────────────────────────────────
         private async Task EnsureCrumbAsync(CancellationToken ct)
         {
             if (!string.IsNullOrEmpty(_crumb)) return;
@@ -98,28 +124,21 @@ namespace StockMonitor
                 if (!string.IsNullOrEmpty(_crumb)) return;
 
                 // Step1: Yahoo Finance にアクセスして cookie を取得
-                using var handler = new HttpClientHandler { UseCookies = false };
-                using var client  = new HttpClient(handler);
-                client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-                client.DefaultRequestHeaders.TryAddWithoutValidation("Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-
-                var resp1 = await client.GetAsync("https://finance.yahoo.com", ct);
+                var req1 = new HttpRequestMessage(HttpMethod.Get, "https://finance.yahoo.com");
+                var resp1 = await _http.SendAsync(req1, ct);
                 var cookieList = new List<string>();
                 if (resp1.Headers.TryGetValues("Set-Cookie", out var setCookies))
                     foreach (var c in setCookies)
                         cookieList.Add(c.Split(';')[0]);
                 _cookie = string.Join("; ", cookieList);
 
-                // Step2: crumb を取得
+                // Step2: crumb 取得
                 var req2 = new HttpRequestMessage(HttpMethod.Get,
                     "https://query1.finance.yahoo.com/v1/test/getcrumb");
-                req2.Headers.TryAddWithoutValidation("Cookie", _cookie);
-                req2.Headers.TryAddWithoutValidation("User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-                var resp2 = await client.SendAsync(req2, ct);
-                _crumb = (await resp2.Content.ReadAsStringAsync()).Trim();
+                if (!string.IsNullOrEmpty(_cookie))
+                    req2.Headers.TryAddWithoutValidation("Cookie", _cookie);
+                var resp2 = await _http.SendAsync(req2, ct);
+                _crumb = (await resp2.Content.ReadAsStringAsync(ct)).Trim();
             }
             finally
             {
@@ -127,11 +146,12 @@ namespace StockMonitor
             }
         }
 
+        // ─── UIイベント ───────────────────────────────────────────────────────
         private void AlertMode_Changed(object sender, RoutedEventArgs e)
         {
             if (PriceModePanel == null || PercentModePanel == null) return;
             bool priceMode = RadioPrice.IsChecked == true;
-            PriceModePanel.Visibility   = priceMode ? Visibility.Visible : Visibility.Collapsed;
+            PriceModePanel.Visibility   = priceMode ? Visibility.Visible  : Visibility.Collapsed;
             PercentModePanel.Visibility = priceMode ? Visibility.Collapsed : Visibility.Visible;
         }
 
@@ -179,6 +199,11 @@ namespace StockMonitor
             _stocks.Remove(_selectedItem);
             _alertedState.Remove(sym + "_high");
             _alertedState.Remove(sym + "_low");
+            _alertedState.Remove(sym + "_surge_up");
+            _alertedState.Remove(sym + "_surge_down");
+            _alertedState.Remove(sym + "_volume");
+            _priceHistory.Remove(sym);
+            _prevDayVolume.Remove(sym);
             SelectItem(null);
         }
 
@@ -192,6 +217,7 @@ namespace StockMonitor
             DeleteButton.IsEnabled = (_selectedItem != null);
         }
 
+        // ─── 銘柄パネル構築 ───────────────────────────────────────────────────
         private void RefreshStockPanel()
         {
             if (_selectedItem != null && !_stocks.Contains(_selectedItem))
@@ -216,17 +242,11 @@ namespace StockMonitor
                     StockPanel.Children.Add(MakeStockCard(item));
             }
 
-            StockCountText.Text = string.Format("{0} 銘柄", _stocks.Count);
+            StockCountText.Text = $"{_stocks.Count} 銘柄";
         }
 
-        private TextBlock MakeGroupHeader(string title, int count)
-        {
-            return new TextBlock
-            {
-                Style = (Style)FindResource("GroupHeader"),
-                Text  = string.Format("{0}  ({1})", title, count)
-            };
-        }
+        private TextBlock MakeGroupHeader(string title, int count) =>
+            new() { Style = (Style)FindResource("GroupHeader"), Text = $"{title}  ({count})" };
 
         private Border MakeStockCard(StockItem item)
         {
@@ -242,8 +262,7 @@ namespace StockMonitor
                 new System.Windows.Data.Binding("BorderColor") { Source = item, Converter = new ColorStringToBrushConverter() });
             card.SetBinding(Border.BackgroundProperty,
                 new System.Windows.Data.Binding("BackgroundColor") { Source = item, Converter = new ColorStringToBrushConverter() });
-            card.MouseLeftButtonUp += (_, __) =>
-                SelectItem(_selectedItem == item ? null : item);
+            card.MouseLeftButtonUp += (_, _) => SelectItem(_selectedItem == item ? null : item);
 
             var outer = new StackPanel();
 
@@ -252,34 +271,33 @@ namespace StockMonitor
             row1.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             row1.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-            var leftTop = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-            var nameRow = new StackPanel { Orientation = Orientation.Horizontal };
+            var leftTop  = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            var nameRow  = new StackPanel { Orientation = Orientation.Horizontal };
             var nameBlock = new TextBlock { Foreground = Brushes.WhiteSmoke, FontSize = 14, FontWeight = FontWeights.Bold };
             nameBlock.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("DisplayName") { Source = item });
 
             var exchangeBadge = new Border
             {
-                CornerRadius = new CornerRadius(3),
-                Background   = new SolidColorBrush(Color.FromRgb(30, 40, 60)),
-                Padding      = new Thickness(5, 1, 5, 1),
-                Margin       = new Thickness(6, 2, 0, 0),
+                CornerRadius      = new CornerRadius(3),
+                Background        = new SolidColorBrush(Color.FromRgb(30, 40, 60)),
+                Padding           = new Thickness(5, 1, 5, 1),
+                Margin            = new Thickness(6, 2, 0, 0),
                 VerticalAlignment = VerticalAlignment.Center
             };
             var exchText = new TextBlock { FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(88, 166, 255)) };
             exchText.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("Exchange") { Source = item });
             exchangeBadge.Child = exchText;
 
-            nameRow.Children.Add(nameBlock);
-            nameRow.Children.Add(exchangeBadge);
-
             var statusBlock = new TextBlock { FontSize = 11, Margin = new Thickness(0, 3, 0, 0) };
             statusBlock.SetBinding(TextBlock.TextProperty,       new System.Windows.Data.Binding("StatusMessage") { Source = item });
             statusBlock.SetBinding(TextBlock.ForegroundProperty, new System.Windows.Data.Binding("StatusColor")   { Source = item, Converter = new ColorStringToBrushConverter() });
 
+            nameRow.Children.Add(nameBlock);
+            nameRow.Children.Add(exchangeBadge);
             leftTop.Children.Add(nameRow);
             leftTop.Children.Add(statusBlock);
 
-            var rightTop = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
+            var rightTop   = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
             var priceBlock = new TextBlock { FontSize = 20, FontWeight = FontWeights.Bold, HorizontalAlignment = HorizontalAlignment.Right };
             priceBlock.SetBinding(TextBlock.TextProperty,       new System.Windows.Data.Binding("PriceText")  { Source = item });
             priceBlock.SetBinding(TextBlock.ForegroundProperty, new System.Windows.Data.Binding("PriceColor") { Source = item, Converter = new ColorStringToBrushConverter() });
@@ -298,12 +316,7 @@ namespace StockMonitor
             outer.Children.Add(row1);
 
             // 区切り線
-            outer.Children.Add(new Border
-            {
-                Height     = 1,
-                Background = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
-                Margin     = new Thickness(0, 8, 0, 8)
-            });
+            outer.Children.Add(Divider());
 
             // Row2: 詳細グリッド
             var detailGrid = new UniformGrid { Columns = 3, Rows = 2 };
@@ -316,30 +329,39 @@ namespace StockMonitor
             outer.Children.Add(detailGrid);
 
             // 区切り線
-            outer.Children.Add(new Border
-            {
-                Height     = 1,
-                Background = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
-                Margin     = new Thickness(0, 8, 0, 6)
-            });
+            outer.Children.Add(Divider());
 
             // Row3: 52週レンジ
-            var rangeLabelStack = new StackPanel { Orientation = Orientation.Horizontal };
-            rangeLabelStack.Children.Add(new TextBlock { Text = "52週安値 ", Foreground = new SolidColorBrush(Color.FromRgb(139, 148, 158)), FontSize = 10 });
-            var w52LowTb = new TextBlock { FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(248, 81, 73)) };
-            w52LowTb.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("Week52Low") { Source = item });
-            rangeLabelStack.Children.Add(w52LowTb);
-            rangeLabelStack.Children.Add(new TextBlock { Text = "  〜  52週高値 ", Foreground = new SolidColorBrush(Color.FromRgb(139, 148, 158)), FontSize = 10 });
-            var w52HighTb = new TextBlock { FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(63, 185, 80)) };
-            w52HighTb.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("Week52High") { Source = item });
-            rangeLabelStack.Children.Add(w52HighTb);
-            outer.Children.Add(rangeLabelStack);
+            var rangeStack = new StackPanel { Orientation = Orientation.Horizontal };
+            rangeStack.Children.Add(MakeRangeLabel("52週安値 "));
+            var w52Low = new TextBlock { FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(248, 81, 73)) };
+            w52Low.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("Week52Low") { Source = item });
+            rangeStack.Children.Add(w52Low);
+            rangeStack.Children.Add(MakeRangeLabel("  〜  52週高値 "));
+            var w52High = new TextBlock { FontSize = 10, Foreground = new SolidColorBrush(Color.FromRgb(63, 185, 80)) };
+            w52High.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding("Week52High") { Source = item });
+            rangeStack.Children.Add(w52High);
+            outer.Children.Add(rangeStack);
 
             card.Child = outer;
             return card;
         }
 
-        private StackPanel MakeDetailCell(string label, StockItem item, string bindPath)
+        private static Border Divider() => new()
+        {
+            Height     = 1,
+            Background = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
+            Margin     = new Thickness(0, 8, 0, 8)
+        };
+
+        private static TextBlock MakeRangeLabel(string text) => new()
+        {
+            Text       = text,
+            Foreground = new SolidColorBrush(Color.FromRgb(139, 148, 158)),
+            FontSize   = 10
+        };
+
+        private static StackPanel MakeDetailCell(string label, StockItem item, string bindPath)
         {
             var cell = new StackPanel { Margin = new Thickness(0, 2, 8, 4) };
             cell.Children.Add(new TextBlock
@@ -354,6 +376,7 @@ namespace StockMonitor
             return cell;
         }
 
+        // ─── 監視スタート/ストップ ────────────────────────────────────────────
         private void StartButton_Click(object sender, RoutedEventArgs e)
         {
             if (_stocks.Count == 0)
@@ -361,14 +384,9 @@ namespace StockMonitor
                 MessageBox.Show("銘柄を1つ以上追加してください。", "エラー", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
-            if (int.TryParse(IntervalInput.Text, out var secs) && secs >= 10)
-                _intervalSeconds = secs;
-            else
-            {
-                _intervalSeconds = 30;
-                IntervalInput.Text = "30";
-            }
-            IntervalHint.Text = string.Format("{0}秒ごとに全銘柄を取得します", _intervalSeconds);
+            _intervalSeconds = int.TryParse(IntervalInput.Text, out var secs) && secs >= 10 ? secs : 30;
+            IntervalInput.Text = _intervalSeconds.ToString();
+            IntervalHint.Text = $"{_intervalSeconds}秒ごとに全銘柄を取得します";
 
             _isRunning = true;
             _cts = new CancellationTokenSource();
@@ -402,28 +420,26 @@ namespace StockMonitor
             var symbols = _stocks.Select(s => s.Symbol).ToList();
             await Task.WhenAll(symbols.Select(sym => FetchSingleAsync(sym, ct)));
             Dispatcher.Invoke(() =>
-                LastUpdateText.Text = string.Format("最終更新: {0:HH:mm:ss}", DateTime.Now));
+                LastUpdateText.Text = $"最終更新: {DateTime.Now:HH:mm:ss}");
         }
 
+        // ─── 株価取得（v8 chart + v11 quoteSummary 組み合わせ） ──────────────
         private async Task FetchSingleAsync(string symbol, CancellationToken ct)
         {
             try
             {
-                // v8 chart は crumb 不要（テストで v8/q1 が成功済み）
-                var url = string.Format(
-                    "https://query1.finance.yahoo.com/v8/finance/chart/{0}?interval=1d&range=1d&includePrePost=true",
-                    Uri.EscapeDataString(symbol));
-
-                var resp = await _http.GetAsync(url, ct);
-                if (!resp.IsSuccessStatusCode)
+                // ── v8 chart で基本情報取得（crumb不要） ──
+                var chartUrl = $"https://query1.finance.yahoo.com/v8/finance/chart/{Uri.EscapeDataString(symbol)}?interval=1d&range=1d&includePrePost=true";
+                var chartResp = await _http.GetAsync(chartUrl, ct);
+                if (!chartResp.IsSuccessStatusCode)
                 {
-                    UpdateDisplay(symbol, null, null, null, string.Format("HTTP {0}", (int)resp.StatusCode));
+                    UpdateDisplay(symbol, null, null, null, $"HTTP {(int)chartResp.StatusCode}");
                     return;
                 }
 
-                var json = await resp.Content.ReadAsStringAsync();
-                using var doc = JsonDocument.Parse(json);
-                var meta = doc.RootElement
+                var chartJson = await chartResp.Content.ReadAsStringAsync(ct);
+                using var chartDoc = JsonDocument.Parse(chartJson);
+                var meta = chartDoc.RootElement
                     .GetProperty("chart")
                     .GetProperty("result")[0]
                     .GetProperty("meta");
@@ -431,175 +447,157 @@ namespace StockMonitor
                 double price     = meta.GetProperty("regularMarketPrice").GetDouble();
                 double prevClose = meta.GetProperty("chartPreviousClose").GetDouble();
 
-                // 市場状態
-                string marketState = "";
-                if (meta.TryGetProperty("marketState", out var ms))
-                    marketState = ms.GetString() ?? "";
+                string marketState = meta.TryGetProperty("marketState", out var ms) ? (ms.GetString() ?? "") : "";
+                string priceLabel  = MarketStateLabel(marketState);
 
                 double displayPrice = price;
-                string priceLabel   = MarketStateLabel(marketState);
-
-                // プレ・アフター価格があれば優先
-                if (marketState == "PRE" && meta.TryGetProperty("preMarketPrice", out var pre) && pre.ValueKind == JsonValueKind.Number)
+                if (marketState == "PRE"  && meta.TryGetProperty("preMarketPrice",  out var pre)  && pre.ValueKind  == JsonValueKind.Number)
                     displayPrice = pre.GetDouble();
                 else if (marketState == "POST" && meta.TryGetProperty("postMarketPrice", out var post) && post.ValueKind == JsonValueKind.Number)
                     displayPrice = post.GetDouble();
 
-                // 銘柄名
                 string name = symbol;
                 if (meta.TryGetProperty("shortName", out var sn) && !string.IsNullOrEmpty(sn.GetString()))
                     name = sn.GetString()!;
-                else if (meta.TryGetProperty("instrumentType", out _) && meta.TryGetProperty("exchangeName", out var exn))
-                    name = symbol; // fallback
 
                 double changePct = prevClose != 0.0
                     ? (displayPrice - prevClose) / prevClose * 100.0
                     : 0.0;
 
-                // v8 meta から取れる詳細情報を詰める
-                var detail = new StockDetail();
-                detail.MarketState = priceLabel;
-                bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
+                bool   isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
                 string unit = isJp ? "円" : "$";
                 string fmt  = isJp ? "N0" : "F2";
 
-                if (meta.TryGetProperty("regularMarketDayHigh", out var hi))
-                    detail.DayHigh = unit + hi.GetDouble().ToString(fmt);
-                if (meta.TryGetProperty("regularMarketDayLow", out var lo))
-                    detail.DayLow  = unit + lo.GetDouble().ToString(fmt);
-                if (meta.TryGetProperty("regularMarketOpen", out var op))
-                    detail.Open    = unit + op.GetDouble().ToString(fmt);
+                // v8 meta から取れる基本詳細
+                var detail = new StockDetail { MarketState = priceLabel };
+                if (meta.TryGetProperty("regularMarketDayHigh",   out var hi))  detail.DayHigh = unit + hi.GetDouble().ToString(fmt);
+                if (meta.TryGetProperty("regularMarketDayLow",    out var lo))  detail.DayLow  = unit + lo.GetDouble().ToString(fmt);
+                if (meta.TryGetProperty("regularMarketOpen",      out var op))  detail.Open    = unit + op.GetDouble().ToString(fmt);
+                if (meta.TryGetProperty("exchangeName",            out var exn)) detail.Exchange = exn.GetString() ?? "--";
+                if (meta.TryGetProperty("currency",                out var cur)) detail.Currency = cur.GetString() ?? "--";
+
+                long currentVolume = 0;
                 if (meta.TryGetProperty("regularMarketVolume", out var vol))
                 {
-                    long v = vol.GetInt64();
-                    detail.Volume = isJp
-                        ? v.ToString("N0") + "株"
-                        : v >= 1_000_000 ? (v / 1_000_000.0).ToString("F1") + "M株"
-                        : v >= 1_000     ? (v / 1_000.0).ToString("F0") + "K株"
-                        : v.ToString("N0") + "株";
+                    currentVolume = vol.GetInt64();
+                    detail.Volume = FormatVolume(currentVolume, isJp);
                 }
-                if (meta.TryGetProperty("exchangeName", out var exName))
-                    detail.Exchange = exName.GetString() ?? "--";
-                if (meta.TryGetProperty("currency", out var cur))
-                    detail.Currency = cur.GetString() ?? "--";
+
+                // ── v11 quoteSummary で追加情報（MarketCap / PER / 52週高安値）取得 ──
+                await TryFetchQuoteSummaryAsync(symbol, detail, isJp, fmt, unit, ct);
 
                 RecordPriceHistory(symbol, displayPrice);
                 UpdateDisplay(symbol, displayPrice, prevClose, changePct, null, name, detail);
-                await CheckAlertAsync(symbol, displayPrice, prevClose, changePct, name, ct);
+                await CheckAlertAsync(symbol, displayPrice, prevClose, changePct, currentVolume, name, ct);
             }
             catch (TaskCanceledException) { }
             catch (Exception ex)
             {
-                var msg = ex.Message.Length > 50 ? ex.Message.Substring(0, 50) + "…" : ex.Message;
+                var msg = ex.Message.Length > 60 ? ex.Message[..60] + "…" : ex.Message;
                 UpdateDisplay(symbol, null, null, null, msg);
             }
         }
 
-        private string MarketStateLabel(string state)
+        /// <summary>
+        /// v11 quoteSummary エンドポイントから MarketCap / PER / 52週高安値 を取得して detail に詰める。
+        /// 失敗しても例外を投げずに無視する（基本情報は v8 で取得済みのため）。
+        /// </summary>
+        private async Task TryFetchQuoteSummaryAsync(
+            string symbol, StockDetail detail, bool isJp, string fmt, string unit, CancellationToken ct)
         {
-            switch (state)
+            try
             {
-                case "REGULAR": return "取引中";
-                case "PRE":     return "プレマーケット";
-                case "POST":    return "アフターマーケット";
-                case "CLOSED":  return "取引終了";
-                default:        return state;
+                // crumb が未取得なら取得を試みる
+                if (string.IsNullOrEmpty(_crumb))
+                    await EnsureCrumbAsync(ct);
+
+                var summaryUrl = $"https://query1.finance.yahoo.com/v11/finance/quoteSummary/{Uri.EscapeDataString(symbol)}" +
+                                 $"?modules=summaryDetail,price&crumb={Uri.EscapeDataString(_crumb)}";
+
+                var req = new HttpRequestMessage(HttpMethod.Get, summaryUrl);
+                if (!string.IsNullOrEmpty(_cookie))
+                    req.Headers.TryAddWithoutValidation("Cookie", _cookie);
+
+                var resp = await _http.SendAsync(req, ct);
+                if (!resp.IsSuccessStatusCode) return;
+
+                var json = await resp.Content.ReadAsStringAsync(ct);
+                using var doc = JsonDocument.Parse(json);
+
+                if (!doc.RootElement.TryGetProperty("quoteSummary", out var qs)) return;
+                if (!qs.TryGetProperty("result", out var results) || results.ValueKind != JsonValueKind.Array) return;
+                var result = results[0];
+
+                if (result.TryGetProperty("price", out var pr))
+                {
+                    double mc = GetRaw(pr, "marketCap");
+                    if (mc > 0) detail.MarketCap = FormatLargeNum(mc, isJp);
+
+                    double pe = GetRaw(pr, "trailingPE");
+                    if (pe > 0) detail.PeRatio = pe.ToString("F1") + "x";
+                }
+
+                if (result.TryGetProperty("summaryDetail", out var sd))
+                {
+                    double w52h = GetRaw(sd, "fiftyTwoWeekHigh");
+                    double w52l = GetRaw(sd, "fiftyTwoWeekLow");
+                    if (w52h > 0) detail.Week52High = unit + w52h.ToString(fmt);
+                    if (w52l > 0) detail.Week52Low  = unit + w52l.ToString(fmt);
+
+                    // 前日出来高をキャッシュ（出来高急増判定用）
+                    double avgVol = GetRaw(sd, "averageVolume");
+                    if (avgVol > 0)
+                        _prevDayVolume[symbol] = (long)avgVol;
+                }
             }
+            catch { /* quoteSummary は補助情報なので失敗しても続行 */ }
         }
 
-        private double GetRaw(JsonElement el, string key)
+        private static string MarketStateLabel(string state) => state switch
         {
-            if (el.TryGetProperty(key, out var v))
-            {
-                if (v.ValueKind == JsonValueKind.Object && v.TryGetProperty("raw", out var r))
-                    return r.GetDouble();
-                if (v.ValueKind == JsonValueKind.Number)
-                    return v.GetDouble();
-            }
+            "REGULAR" => "取引中",
+            "PRE"     => "プレマーケット",
+            "POST"    => "アフターマーケット",
+            "CLOSED"  => "取引終了",
+            _         => state
+        };
+
+        // JSON から raw 値を取得するヘルパー
+        private static double GetRaw(JsonElement el, string key)
+        {
+            if (!el.TryGetProperty(key, out var v)) return 0.0;
+            if (v.ValueKind == JsonValueKind.Object && v.TryGetProperty("raw", out var r))
+                return r.GetDouble();
+            if (v.ValueKind == JsonValueKind.Number)
+                return v.GetDouble();
             return 0.0;
         }
 
-        private StockDetail ParseDetail(JsonElement root, string symbol)
+        private static string FormatVolume(long vol, bool isJp)
         {
-            var d = new StockDetail();
-            bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
-            string fmt  = isJp ? "N0" : "F2";
-            string unit = isJp ? "円" : "$";
-
-            if (root.TryGetProperty("price", out var pr))
-            {
-                d.Open      = FormatNum(pr, "regularMarketOpen",    fmt, unit);
-                d.DayHigh   = FormatNum(pr, "regularMarketDayHigh", fmt, unit);
-                d.DayLow    = FormatNum(pr, "regularMarketDayLow",  fmt, unit);
-                d.Volume    = FormatVolume(pr, "regularMarketVolume", isJp);
-                d.MarketCap = FormatLargeNum(pr, "marketCap", isJp);
-                if (pr.TryGetProperty("exchangeName",   out var ex))  d.Exchange = ex.GetString()  ?? "--";
-                if (pr.TryGetProperty("currencySymbol", out var cur)) d.Currency = cur.GetString() ?? "--";
-            }
-
-            if (root.TryGetProperty("summaryDetail", out var sd))
-            {
-                d.PeRatio    = FormatNum(sd, "trailingPE",       "F1", "x");
-                d.Week52High = FormatNum(sd, "fiftyTwoWeekHigh", fmt,  unit);
-                d.Week52Low  = FormatNum(sd, "fiftyTwoWeekLow",  fmt,  unit);
-            }
-
-            return d;
+            if (isJp)              return vol.ToString("N0") + "株";
+            if (vol >= 1_000_000) return (vol / 1_000_000.0).ToString("F1") + "M株";
+            if (vol >= 1_000)     return (vol / 1_000.0).ToString("F0") + "K株";
+            return vol.ToString("N0") + "株";
         }
 
-        private string FormatNum(JsonElement el, string key, string fmt, string suffix)
+        private static string FormatLargeNum(double val, bool isJp)
         {
-            if (el.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Object
-                && v.TryGetProperty("raw", out var raw))
+            if (isJp)
             {
-                double val    = raw.GetDouble();
-                string numStr = val.ToString(fmt);
-                return suffix == "x" ? numStr + suffix : suffix + numStr;
+                if (val >= 1_000_000_000_000) return (val / 1_000_000_000_000.0).ToString("F1") + "兆円";
+                if (val >= 100_000_000)       return (val / 100_000_000.0).ToString("F1") + "億円";
+                return val.ToString("N0") + "円";
             }
-            return "--";
+            else
+            {
+                if (val >= 1_000_000_000) return "$" + (val / 1_000_000_000.0).ToString("F1") + "B";
+                if (val >= 1_000_000)     return "$" + (val / 1_000_000.0).ToString("F1") + "M";
+                return "$" + val.ToString("N0");
+            }
         }
 
-        private string FormatVolume(JsonElement el, string key, bool isJp)
-        {
-            if (el.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Object
-                && v.TryGetProperty("raw", out var raw))
-            {
-                long vol = raw.GetInt64();
-                if (isJp)           return vol.ToString("N0") + "株";
-                if (vol >= 1_000_000) return (vol / 1_000_000.0).ToString("F1") + "M株";
-                if (vol >= 1_000)     return (vol / 1_000.0).ToString("F0") + "K株";
-                return vol.ToString("N0") + "株";
-            }
-            return "--";
-        }
-
-        private string FormatLargeNum(JsonElement el, string key, bool isJp)
-        {
-            if (el.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Object
-                && v.TryGetProperty("raw", out var raw))
-            {
-                double val  = raw.GetDouble();
-                string unit = isJp ? "" : "$";
-                string suf  = "";
-                double disp = val;
-
-                if (isJp)
-                {
-                    if      (val >= 1_000_000_000_000) { disp = val / 1_000_000_000_000.0; suf = "兆円"; }
-                    else if (val >= 100_000_000)        { disp = val / 100_000_000.0;       suf = "億円"; }
-                    else                                { suf = "円"; }
-                    return disp.ToString(suf.StartsWith("兆") || suf.StartsWith("億") ? "F1" : "N0") + suf;
-                }
-                else
-                {
-                    if      (val >= 1_000_000_000) { disp = val / 1_000_000_000.0; suf = "B"; }
-                    else if (val >= 1_000_000)     { disp = val / 1_000_000.0;     suf = "M"; }
-                    return unit + disp.ToString(suf.Length > 0 ? "F1" : "N0") + suf;
-                }
-            }
-            return "--";
-        }
-
+        // ─── 表示更新 ─────────────────────────────────────────────────────────
         private void UpdateDisplay(
             string symbol, double? price, double? prevClose, double? changePct,
             string? errorMsg, string? name = null, StockDetail? detail = null)
@@ -611,31 +609,29 @@ namespace StockMonitor
                 if (item == null) return;
 
                 if (!string.IsNullOrEmpty(name) && name != symbol)
-                    item.DisplayName = string.Format("{0}  ({1})", name, symbol);
+                    item.DisplayName = $"{name}  ({symbol})";
 
                 if (price.HasValue)
                 {
                     bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
-                    item.PriceText = isJp
-                        ? string.Format("¥{0:N0}", price.Value)
-                        : string.Format("${0:F2}", price.Value);
+                    item.PriceText = isJp ? $"¥{price.Value:N0}" : $"${price.Value:F2}";
 
                     if (changePct.HasValue)
                     {
-                        var sign = changePct.Value >= 0 ? "▲" : "▼";
-                        double diff = prevClose.HasValue ? price.Value - prevClose.Value : 0;
+                        string sign  = changePct.Value >= 0 ? "▲" : "▼";
+                        double diff  = prevClose.HasValue ? price.Value - prevClose.Value : 0;
                         string diffStr = isJp
-                            ? string.Format("{0:+0;-0;0}円", diff)
-                            : string.Format("{0:+0.00;-0.00;0.00}ドル", diff);
-                        item.ChangeText  = string.Format("{0} {1:F2}%  ({2})", sign, Math.Abs(changePct.Value), diffStr);
+                            ? $"{diff:+0;-0;0}円"
+                            : $"{diff:+0.00;-0.00;0.00}ドル";
+                        item.ChangeText  = $"{sign} {Math.Abs(changePct.Value):F2}%  ({diffStr})";
                         item.ChangeColor = changePct.Value >= 0 ? "#3FB950" : "#F85149";
-                        item.PriceColor  = changePct.Value > 0 ? "#3FB950" : changePct.Value < 0 ? "#F85149" : "#F0F6FC";
+                        item.PriceColor  = changePct.Value > 0 ? "#3FB950"
+                                         : changePct.Value < 0 ? "#F85149" : "#F0F6FC";
                     }
 
                     item.StatusMessage = string.IsNullOrEmpty(detail?.MarketState) ? "取得成功" : detail.MarketState;
                     item.StatusColor   = detail?.MarketState == "取引中"   ? "#3FB950"
-                                       : detail?.MarketState == "取引終了" ? "#8B949E"
-                                       : "#E3B341";
+                                       : detail?.MarketState == "取引終了" ? "#8B949E" : "#E3B341";
                     item.BorderColor   = item.IsSelected ? "#58A6FF" : "#30363D";
 
                     if (detail != null)
@@ -663,6 +659,7 @@ namespace StockMonitor
             });
         }
 
+        // ─── 価格履歴記録 ────────────────────────────────────────────────────
         private void RecordPriceHistory(string symbol, double price)
         {
             if (!_priceHistory.ContainsKey(symbol))
@@ -672,9 +669,10 @@ namespace StockMonitor
             while (q.Count > 3600) q.Dequeue();
         }
 
+        // ─── アラート判定 ─────────────────────────────────────────────────────
         private async Task CheckAlertAsync(
             string symbol, double price, double prevClose,
-            double changePct, string name, CancellationToken ct)
+            double changePct, long currentVolume, string name, CancellationToken ct)
         {
             bool enabled = false;
             bool priceMode = true;
@@ -690,22 +688,21 @@ namespace StockMonitor
                 enabled   = EnableAlertCheck.IsChecked == true;
                 priceMode = RadioPrice.IsChecked == true;
                 webhook   = WebhookInput.Text.Trim();
-                double v;
                 if (priceMode)
                 {
-                    if (double.TryParse(AlertHighPriceInput.Text, out v)) highPrice = v;
-                    if (double.TryParse(AlertLowPriceInput.Text,  out v)) lowPrice  = v;
+                    if (double.TryParse(AlertHighPriceInput.Text, out var v)) highPrice = v;
+                    if (double.TryParse(AlertLowPriceInput.Text,  out var v2)) lowPrice = v2;
                 }
                 else
                 {
-                    if (double.TryParse(AlertHighPctInput.Text, out v)) highPct = v;
-                    if (double.TryParse(AlertLowPctInput.Text,  out v)) lowPct  = v;
+                    if (double.TryParse(AlertHighPctInput.Text, out var v))  highPct = v;
+                    if (double.TryParse(AlertLowPctInput.Text,  out var v2)) lowPct  = v2;
                 }
-                if (int.TryParse(SurgeSecondsInput.Text,    out var ss) && ss > 0) surgeSeconds = ss;
-                if (double.TryParse(SurgeUpPctInput.Text,   out v)) surgeUp   = v;
-                if (double.TryParse(SurgeDownPctInput.Text, out v)) surgeDown = v;
-                if (double.TryParse(VolumeRatioInput.Text,  out v)) volRatio  = v;
-                if (double.TryParse(VolumeMinInput.Text,    out v)) volMin    = v;
+                if (int.TryParse(SurgeSecondsInput.Text, out var ss) && ss > 0) surgeSeconds = ss;
+                if (double.TryParse(SurgeUpPctInput.Text,   out var su)) surgeUp   = su;
+                if (double.TryParse(SurgeDownPctInput.Text, out var sd)) surgeDown = sd;
+                if (double.TryParse(VolumeRatioInput.Text,  out var vr)) volRatio  = vr;
+                if (double.TryParse(VolumeMinInput.Text,    out var vm)) volMin    = vm;
             });
 
             if (!enabled || string.IsNullOrEmpty(webhook)) return;
@@ -717,6 +714,8 @@ namespace StockMonitor
                 ? (lowPrice.HasValue && price <= lowPrice.Value)
                 : (lowPct.HasValue   && changePct <= lowPct.Value);
 
+            bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
+            string priceStr = isJp ? $"{price:N0}円" : $"{price:F2}ドル";
             string? msg = null;
 
             if (hitHigh)
@@ -724,13 +723,10 @@ namespace StockMonitor
                 var key = symbol + "_high";
                 if (!_alertedState.ContainsKey(key))
                 {
-                    bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
-                    string priceStr = isJp ? string.Format("{0:N0}円", price) : string.Format("{0:F2}ドル", price);
-                    string condStr  = priceMode
-                        ? string.Format("上限価格 {0:N0}{1}", highPrice!.Value, isJp ? "円" : "ドル")
-                        : string.Format("上昇率 +{0:F2}%", highPct!.Value);
-                    msg = string.Format("🚀 **{0}** が条件達成！\n現在値: **{1}**  前日比: **▲{2:F2}%**\n条件: {3}",
-                        name, priceStr, Math.Abs(changePct), condStr);
+                    string condStr = priceMode
+                        ? $"上限価格 {highPrice!.Value:N0}{(isJp ? "円" : "ドル")}"
+                        : $"上昇率 +{highPct!.Value:F2}%";
+                    msg = $"🚀 **{name}** が条件達成！\n現在値: **{priceStr}**  前日比: **▲{Math.Abs(changePct):F2}%**\n条件: {condStr}";
                     _alertedState[key] = "alerted";
                     _alertedState.Remove(symbol + "_low");
                 }
@@ -740,13 +736,10 @@ namespace StockMonitor
                 var key = symbol + "_low";
                 if (!_alertedState.ContainsKey(key))
                 {
-                    bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
-                    string priceStr = isJp ? string.Format("{0:N0}円", price) : string.Format("{0:F2}ドル", price);
-                    string condStr  = priceMode
-                        ? string.Format("下限価格 {0:N0}{1}", lowPrice!.Value, isJp ? "円" : "ドル")
-                        : string.Format("下落率 {0:F2}%", lowPct!.Value);
-                    msg = string.Format("📉 **{0}** が条件達成！\n現在値: **{1}**  前日比: **▼{2:F2}%**\n条件: {3}",
-                        name, priceStr, Math.Abs(changePct), condStr);
+                    string condStr = priceMode
+                        ? $"下限価格 {lowPrice!.Value:N0}{(isJp ? "円" : "ドル")}"
+                        : $"下落率 {lowPct!.Value:F2}%";
+                    msg = $"📉 **{name}** が条件達成！\n現在値: **{priceStr}**  前日比: **▼{Math.Abs(changePct):F2}%**\n条件: {condStr}";
                     _alertedState[key] = "alerted";
                     _alertedState.Remove(symbol + "_high");
                 }
@@ -760,7 +753,11 @@ namespace StockMonitor
             if (msg != null)
                 await SendDiscordAsync(webhook, msg, ct);
 
+            // 急騰・急落チェック
             await CheckSurgeAsync(symbol, name, price, surgeSeconds, surgeUp, surgeDown, webhook, ct);
+
+            // 出来高急増チェック（実装）
+            await CheckVolumeAsync(symbol, name, currentVolume, volRatio, volMin, webhook, ct);
         }
 
         private async Task CheckSurgeAsync(
@@ -771,12 +768,14 @@ namespace StockMonitor
             if (surgeUpPct == null && surgeDownPct == null) return;
             if (!_priceHistory.ContainsKey(symbol)) return;
 
-            var q      = _priceHistory[symbol];
-            var cutoff = DateTime.Now.AddSeconds(-windowSeconds);
+            var q        = _priceHistory[symbol];
+            var cutoff   = DateTime.Now.AddSeconds(-windowSeconds);
             var baseline = q.Where(p => p.time >= cutoff).OrderBy(p => p.time).FirstOrDefault();
             if (baseline.price == 0) return;
 
             double surgePct = (currentPrice - baseline.price) / baseline.price * 100.0;
+            bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
+            string priceStr = isJp ? $"{currentPrice:N0}円" : $"{currentPrice:F2}ドル";
             string? surgeMsg = null;
 
             if (surgeUpPct.HasValue && surgePct >= surgeUpPct.Value)
@@ -784,10 +783,7 @@ namespace StockMonitor
                 var key = symbol + "_surge_up";
                 if (!_alertedState.ContainsKey(key))
                 {
-                    bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
-                    string priceStr = isJp ? string.Format("{0:N0}円", currentPrice) : string.Format("{0:F2}ドル", currentPrice);
-                    surgeMsg = string.Format("🔥 **{0}** 急騰検知！\n直近{1}秒で **+{2:F2}%** 上昇\n現在値: **{3}**",
-                        name, windowSeconds, surgePct, priceStr);
+                    surgeMsg = $"🔥 **{name}** 急騰検知！\n直近{windowSeconds}秒で **+{surgePct:F2}%** 上昇\n現在値: **{priceStr}**";
                     _alertedState[key] = "alerted";
                     _alertedState.Remove(symbol + "_surge_down");
                 }
@@ -797,10 +793,7 @@ namespace StockMonitor
                 var key = symbol + "_surge_down";
                 if (!_alertedState.ContainsKey(key))
                 {
-                    bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
-                    string priceStr = isJp ? string.Format("{0:N0}円", currentPrice) : string.Format("{0:F2}ドル", currentPrice);
-                    surgeMsg = string.Format("📉 **{0}** 急落検知！\n直近{1}秒で **{2:F2}%** 下落\n現在値: **{3}**",
-                        name, windowSeconds, surgePct, priceStr);
+                    surgeMsg = $"📉 **{name}** 急落検知！\n直近{windowSeconds}秒で **{surgePct:F2}%** 下落\n現在値: **{priceStr}**";
                     _alertedState[key] = "alerted";
                     _alertedState.Remove(symbol + "_surge_up");
                 }
@@ -815,6 +808,45 @@ namespace StockMonitor
                 await SendDiscordAsync(webhook, surgeMsg, ct);
         }
 
+        /// <summary>
+        /// 出来高急増アラート。
+        /// 当日出来高 >= 平均出来高 × 倍率 かつ 当日出来高 >= 最低出来高（万株）のときに通知。
+        /// </summary>
+        private async Task CheckVolumeAsync(
+            string symbol, string name, long currentVolume,
+            double? ratioThreshold, double? minVolume10k,
+            string webhook, CancellationToken ct)
+        {
+            if (ratioThreshold == null && minVolume10k == null) return;
+            if (currentVolume <= 0) return;
+
+            // 平均出来高が取得できていない場合はスキップ
+            if (!_prevDayVolume.TryGetValue(symbol, out long avgVolume) || avgVolume <= 0) return;
+
+            double ratio = (double)currentVolume / avgVolume;
+
+            bool hitRatio = ratioThreshold.HasValue && ratio >= ratioThreshold.Value;
+            bool hitMin   = minVolume10k.HasValue   && currentVolume >= (long)(minVolume10k.Value * 10_000);
+            bool triggered = hitRatio && (!minVolume10k.HasValue || hitMin)
+                          || (!ratioThreshold.HasValue && hitMin);
+
+            if (!triggered)
+            {
+                _alertedState.Remove(symbol + "_volume");
+                return;
+            }
+
+            var key = symbol + "_volume";
+            if (_alertedState.ContainsKey(key)) return;
+
+            bool isJp = symbol.EndsWith(".T", StringComparison.OrdinalIgnoreCase);
+            string volStr = FormatVolume(currentVolume, isJp);
+            string msg    = $"📊 **{name}** 出来高急増！\n当日出来高: **{volStr}**（平均比 **{ratio:F1}倍**）";
+            _alertedState[key] = "alerted";
+            await SendDiscordAsync(webhook, msg, ct);
+        }
+
+        // ─── Discord 送信 ─────────────────────────────────────────────────────
         private async Task SendDiscordAsync(string url, string message, CancellationToken ct)
         {
             try
@@ -823,17 +855,19 @@ namespace StockMonitor
                 var content = new StringContent(payload, Encoding.UTF8, "application/json");
                 await _http.PostAsync(url, content, ct);
                 Dispatcher.Invoke(() => SetStatus("通知送信済", "#E3B341"));
-                _ = Task.Delay(5000).ContinueWith(_ =>
-                    Dispatcher.Invoke(() => { if (_isRunning) SetStatus("監視中", "#3FB950"); }));
+                _ = Task.Delay(5000, ct).ContinueWith(_ =>
+                    Dispatcher.Invoke(() => { if (_isRunning) SetStatus("監視中", "#3FB950"); }),
+                    TaskContinuationOptions.OnlyOnRanToCompletion);
             }
             catch (Exception ex)
             {
                 Dispatcher.Invoke(() =>
-                    MessageBox.Show(string.Format("Discord送信失敗:\n{0}", ex.Message),
-                        "エラー", MessageBoxButton.OK, MessageBoxImage.Error));
+                    MessageBox.Show($"Discord送信失敗:\n{ex.Message}", "エラー",
+                        MessageBoxButton.OK, MessageBoxImage.Error));
             }
         }
 
+        // ─── テストボタン ─────────────────────────────────────────────────────
         private async void TestWebhook_Click(object sender, RoutedEventArgs e)
         {
             var url = WebhookInput.Text.Trim();
@@ -846,29 +880,20 @@ namespace StockMonitor
             MessageBox.Show("テストメッセージを送信しました。", "完了", MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
-        // ─── 日経平均テスト取得 ───────────────────────────────────────────────
         private async void TestNikkei_Click(object sender, RoutedEventArgs e)
         {
             NikkeiPriceText.Text  = "取得中…";
             NikkeiChangeText.Text = "";
 
-            // 複数エンドポイントを順番に試す（どれが動くか確認用）
             var endpoints = new (string label, string url)[]
             {
-                ("v8/q1",
-                 "https://query1.finance.yahoo.com/v8/finance/chart/%5EN225?interval=1d&range=1d"),
-                ("v8/q2",
-                 "https://query2.finance.yahoo.com/v8/finance/chart/%5EN225?interval=1d&range=1d"),
-                ("v11/q1",
-                 string.Format("https://query1.finance.yahoo.com/v11/finance/quoteSummary/%5EN225?modules=price&crumb={0}",
-                     Uri.EscapeDataString(_crumb))),
-                ("v11/q2",
-                 string.Format("https://query2.finance.yahoo.com/v11/finance/quoteSummary/%5EN225?modules=price&crumb={0}",
-                     Uri.EscapeDataString(_crumb))),
+                ("v8/q1", "https://query1.finance.yahoo.com/v8/finance/chart/%5EN225?interval=1d&range=1d"),
+                ("v8/q2", "https://query2.finance.yahoo.com/v8/finance/chart/%5EN225?interval=1d&range=1d"),
+                ("v11/q1", $"https://query1.finance.yahoo.com/v11/finance/quoteSummary/%5EN225?modules=price&crumb={Uri.EscapeDataString(_crumb)}"),
+                ("v11/q2", $"https://query2.finance.yahoo.com/v11/finance/quoteSummary/%5EN225?modules=price&crumb={Uri.EscapeDataString(_crumb)}"),
             };
 
-            var results = new System.Text.StringBuilder();
-
+            var results = new StringBuilder();
             foreach (var ep in endpoints)
             {
                 try
@@ -879,9 +904,7 @@ namespace StockMonitor
 
                     var resp = await _http.SendAsync(req);
                     var body = await resp.Content.ReadAsStringAsync();
-
-                    results.AppendLine(string.Format("[{0}] HTTP {1}", ep.label, (int)resp.StatusCode));
-
+                    results.AppendLine($"[{ep.label}] HTTP {(int)resp.StatusCode}");
                     if (!resp.IsSuccessStatusCode) continue;
 
                     double price = 0, prevClose = 0;
@@ -908,21 +931,20 @@ namespace StockMonitor
                         string sign   = chg >= 0 ? "▲" : "▼";
                         string color  = chg >= 0 ? "#3FB950" : "#F85149";
 
-                        NikkeiPriceText.Text       = string.Format("{0:N0}", price);
-                        NikkeiChangeText.Text       = string.Format("{0}{1:F0}({2:F2}%)", sign, Math.Abs(chg), Math.Abs(chgPct));
+                        NikkeiPriceText.Text       = $"{price:N0}";
+                        NikkeiChangeText.Text       = $"{sign}{Math.Abs(chg):F0}({Math.Abs(chgPct):F2}%)";
                         NikkeiChangeText.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString(color));
 
                         MessageBox.Show(
-                            string.Format("✅ 成功エンドポイント: {0}\n\n日経平均: {1:N0}\n前日比: {2}{3:F0} ({4:F2}%)\n\n全結果:\n{5}",
-                                ep.label, price, sign, Math.Abs(chg), Math.Abs(chgPct), results),
+                            $"✅ 成功: {ep.label}\n\n日経平均: {price:N0}\n前日比: {sign}{Math.Abs(chg):F0} ({Math.Abs(chgPct):F2}%)\n\n全結果:\n{results}",
                             "テスト結果", MessageBoxButton.OK, MessageBoxImage.Information);
                         return;
                     }
                 }
                 catch (Exception ex)
                 {
-                    results.AppendLine(string.Format("[{0}] 例外: {1}", ep.label,
-                        ex.Message.Length > 50 ? ex.Message.Substring(0, 50) : ex.Message));
+                    var s = ex.Message.Length > 50 ? ex.Message[..50] : ex.Message;
+                    results.AppendLine($"[{ep.label}] 例外: {s}");
                 }
             }
 
@@ -930,11 +952,11 @@ namespace StockMonitor
             MessageBox.Show("全エンドポイント失敗:\n\n" + results, "テスト失敗", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
 
+        // ─── ウィンドウクローズ ───────────────────────────────────────────────
         private void Window_Closing(object sender, CancelEventArgs e)
         {
             SaveSettings();
             _cts?.Cancel();
-            _http.Dispose();
         }
 
         private void SetStatus(string text, string hexColor)
@@ -946,6 +968,7 @@ namespace StockMonitor
         }
     }
 
+    // ─── StockItem（MVVM用モデル） ────────────────────────────────────────────
     public class StockItem : INotifyPropertyChanged
     {
         private string _symbol          = "";
@@ -1018,6 +1041,7 @@ namespace StockMonitor
             => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
     }
 
+    // ─── StockDetail（一時データ転送用） ─────────────────────────────────────
     public class StockDetail
     {
         public string Open        { get; set; } = "--";
@@ -1033,6 +1057,7 @@ namespace StockMonitor
         public string MarketState { get; set; } = "";
     }
 
+    // ─── WPFバインディング用 色文字列→Brushコンバーター ──────────────────────
     public class ColorStringToBrushConverter : System.Windows.Data.IValueConverter
     {
         public object Convert(object value, Type targetType, object parameter,
